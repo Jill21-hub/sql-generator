@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Model weights & results (large files — download/train separately)
+results/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Dataset cache (re-downloaded automatically)
+~/.cache/
+*.cache
+
+# Huggingface cache
+.cache/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Env secrets
+.env
+*.env
+
+# Logs
+*.log
+logs/

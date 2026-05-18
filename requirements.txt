@@ -1,0 +1,26 @@
+# Core ML stack
+torch>=2.1.0
+transformers>=4.37.0
+peft>=0.9.0
+accelerate>=0.26.0
+bitsandbytes>=0.42.0
+trl>=0.8.0
+
+# Data
+datasets>=2.16.0
+sentencepiece>=0.1.99
+protobuf>=4.25.2
+
+# Utilities
+nltk>=3.8.1
+sqlitedict>=2.1.0
+scipy>=1.12.0
+einops>=0.7.0
+
+# API server
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.5.0
+
+# Notebook / Kaggle helpers
+ipywidgets>=8.0.0
