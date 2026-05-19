@@ -1,0 +1,19 @@
+# Minimal dependencies for local demo scripts (no GPU / no model download required)
+# Install with: pip install -r requirements-demo.txt
+#
+# This covers:
+#   data/loader_local.py       — Spider data loading
+#   utils/schema_linker.py     — schema linking + test suite
+#   eval/zero_shot_baseline.py — baseline eval in --mock mode
+#   demo/presentation_demo.py  — full pipeline demo (mock mode)
+#   app.py                     — FastAPI backend + Streamlit UI (demo mode)
+
+datasets>=2.16.0
+nltk>=3.8.1
+requests>=2.31.0
+
+# API + UI
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.5.0
+streamlit>=1.32.0

@@ -1,3 +1,2 @@
-from .dataset import SQLDataset, merge_datasets, eval_collate_fn
-
-__all__ = ["SQLDataset", "merge_datasets", "eval_collate_fn"]
+# Heavy training imports (SQLDataset, merge_datasets) are imported explicitly
+# in train.py/eval.py to avoid pulling torch into lightweight local scripts.

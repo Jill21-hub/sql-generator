@@ -1,243 +1,92 @@
 """
-app.py — FastAPI Inference Server
-===================================
-Serves the fine-tuned SQL generation model over HTTP.
+app.py — FastAPI Backend + Streamlit Frontend (Local Demo)
+===========================================================
+Two modes in one file:
+  - `python app.py api`          → starts FastAPI on port 8000
+  - `streamlit run app.py`       → starts Streamlit UI on port 8501
 
-Startup:
-    uvicorn app:app --host 0.0.0.0 --port 8000
+FastAPI endpoint:
+  POST /query  {"question": str, "schema": dict}  → {"sql": str, ...}
 
-Endpoints:
-    POST /generate_sql   — main inference endpoint
-    GET  /health         — liveness probe
+Streamlit UI:
+  - Text input for natural-language question
+  - "Demo Mode" toggle (fast mock) vs "Real Model" (loads CodeLlama)
+  - Shows: filtered schema, predicted SQL, complexity, execution status
+  - Degrades gracefully when no model is loaded
+
+Usage:
+    # Backend only
+    python app.py api --port 8000
+
+    # Frontend (auto-starts backend in same process)
+    streamlit run app.py -- --port 8501
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-from contextlib import asynccontextmanager
-from typing import Optional
+import re
+import sys
+from pathlib import Path
+from typing import Any, Dict, Optional
 
-import torch
-from fastapi import FastAPI, HTTPException
-from peft import PeftModel
-from pydantic import BaseModel, Field
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config import Config
+logger = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Shared — schema linker + inference helpers (used by both API and UI)
+# ──────────────────────────────────────────────────────────────────────────────
+
 from utils.schema_linker import HeuristicSchemaLinker
 
-logger = logging.getLogger("app")
-logging.basicConfig(level=logging.INFO)
+_linker = HeuristicSchemaLinker()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Pydantic models
-# ──────────────────────────────────────────────────────────────────────────────
+_MOCK_SQL_BY_KEYWORD: Dict[str, str] = {
+    "how many":  "SELECT COUNT(*) FROM {table} ;",
+    "list":      "SELECT * FROM {table} ;",
+    "average":   "SELECT AVG({col}) FROM {table} ;",
+    "maximum":   "SELECT MAX({col}) FROM {table} ;",
+    "minimum":   "SELECT MIN({col}) FROM {table} ;",
+    "who":       "SELECT name FROM {table} ;",
+    "where":     "SELECT * FROM {table} WHERE {col} = 'value' ;",
+}
+_MOCK_SQL_DEFAULT = "SELECT * FROM {table} LIMIT 10 ;"
 
-class SQLRequest(BaseModel):
-    schema: str = Field(..., description="Database schema as plain text or JSON string")
-    question: str = Field(..., description="Natural language question to convert to SQL")
-    use_schema_linking: bool = Field(
-        True,
-        description="Apply heuristic schema linking before inference (recommended)",
+
+def _mock_sql(question: str, schema_str: str) -> str:
+    """Generate a plausible-looking mock SQL from the question keywords."""
+    q_low  = question.lower()
+    table  = re.search(r"(\w+)\(", schema_str)
+    table  = table.group(1) if table else "table"
+    col    = re.search(r"\((\w+)", schema_str)
+    col    = col.group(1) if col else "id"
+
+    for kw, tmpl in _MOCK_SQL_BY_KEYWORD.items():
+        if kw in q_low:
+            return tmpl.format(table=table, col=col)
+    return _MOCK_SQL_DEFAULT.format(table=table)
+
+
+def _estimate_complexity(sql: str) -> str:
+    up = sql.upper()
+    score = (
+        up.count("JOIN")
+        + (up.count("SELECT") - 1) * 2
+        + ("GROUP BY" in up)
+        + ("HAVING"   in up)
+        + any(k in up for k in ("INTERSECT", "UNION", "EXCEPT")) * 2
     )
+    if score == 0:  return "easy"
+    if score <= 2:  return "medium"
+    if score <= 4:  return "hard"
+    return "extra hard"
 
 
-class SQLResponse(BaseModel):
-    sql: str
-    filtered_schema: str
-    model_mode: str      # "fine_tuned" or "zero_shot"
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Global model state (populated at startup)
-# ──────────────────────────────────────────────────────────────────────────────
-
-_state: dict = {}
-
-
-def _load_tokenizer(model_id: str) -> AutoTokenizer:
-    tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-        tok.pad_token_id = tok.eos_token_id
-    tok.padding_side = "left"
-    return tok
-
-
-def _load_model(cfg: Config) -> tuple:
-    bnb_cfg = BitsAndBytesConfig(
-        load_in_4bit=cfg.quantization.load_in_4bit,
-        bnb_4bit_use_double_quant=cfg.quantization.bnb_4bit_use_double_quant,
-        bnb_4bit_quant_type=cfg.quantization.bnb_4bit_quant_type,
-        bnb_4bit_compute_dtype=cfg.quantization.bnb_4bit_compute_dtype,
-    )
-
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.model_id,
-        quantization_config=bnb_cfg,
-        device_map="auto",
-        torch_dtype=torch.float16,
-    )
-    model.config.use_cache = True
-
-    lora_dir = cfg.training.lora_weights_dir
-    if os.path.isdir(lora_dir):
-        logger.info("Loading LoRA adapters from %s", lora_dir)
-        model = PeftModel.from_pretrained(model, lora_dir)
-        model = model.merge_and_unload()
-        mode = "fine_tuned"
-    else:
-        logger.warning(
-            "LoRA weights not found at '%s'. Running in zero-shot mode.", lora_dir
-        )
-        mode = "zero_shot"
-
-    model.eval()
-    return model, mode
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Lifespan — load model once at startup, free on shutdown
-# ──────────────────────────────────────────────────────────────────────────────
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    cfg = Config()
-    logger.info("Loading tokenizer and model …")
-    tokenizer = _load_tokenizer(cfg.model_id)
-    model, mode = _load_model(cfg)
-    torch.cuda.empty_cache()
-
-    _state["cfg"] = cfg
-    _state["tokenizer"] = tokenizer
-    _state["model"] = model
-    _state["mode"] = mode
-    _state["schema_linker"] = HeuristicSchemaLinker()
-
-    logger.info("Model ready — mode=%s", mode)
-    yield
-
-    # Cleanup on shutdown
-    del _state["model"]
-    torch.cuda.empty_cache()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# FastAPI app
-# ──────────────────────────────────────────────────────────────────────────────
-
-app = FastAPI(
-    title="SQL Query Generator",
-    description="Fine-tuned CodeLlama-7B that converts natural language to SQL.",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Inference helper
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _infer(prompt: str) -> str:
-    cfg: Config = _state["cfg"]
-    model = _state["model"]
-    tokenizer: AutoTokenizer = _state["tokenizer"]
-    ic = cfg.inference
-
-    inputs = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=cfg.training.max_seq_length,
-    ).to(model.device)
-
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=ic.max_new_tokens,
-            do_sample=ic.do_sample,
-            temperature=ic.temperature,
-            repetition_penalty=ic.repetition_penalty,
-            num_beams=ic.num_beams,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-
-    new_tokens = output_ids[0, inputs["input_ids"].shape[1]:]
-    decoded = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-
-    # Clip at the first semicolon
-    if ";" in decoded:
-        decoded = decoded[: decoded.index(";") + 1]
-
-    return decoded
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Endpoints
-# ──────────────────────────────────────────────────────────────────────────────
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "mode": _state.get("mode", "not_loaded")}
-
-
-@app.post("/generate_sql", response_model=SQLResponse)
-def generate_sql(request: SQLRequest):
-    if not _state.get("model"):
-        raise HTTPException(status_code=503, detail="Model not loaded")
-
-    cfg: Config = _state["cfg"]
-    schema_linker: HeuristicSchemaLinker = _state["schema_linker"]
-
-    # Schema linking: if the schema is plain text we pass it through a minimal
-    # wrapper so HeuristicSchemaLinker can tokenise against it.  If it's a
-    # structured JSON-like dict the caller can send it via a richer endpoint.
-    raw_schema = request.schema
-
-    if request.use_schema_linking:
-        # Wrap plain-text schema into the minimal dict format for the linker.
-        # Lines like "table: col1, col2" are parsed into tables/columns.
-        schema_dict = _parse_plain_schema(raw_schema)
-        filtered_schema = schema_linker.filter_schema(schema_dict, request.question)
-    else:
-        filtered_schema = raw_schema
-
-    prompt = cfg.prompt_template.format(
-        schema=filtered_schema,
-        question=request.question,
-    )
-
-    try:
-        sql = _infer(prompt)
-    except Exception as exc:
-        logger.exception("Inference error")
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    return SQLResponse(
-        sql=sql,
-        filtered_schema=filtered_schema,
-        model_mode=_state["mode"],
-    )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Utility: parse plain-text schema into linker format
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _parse_plain_schema(text: str) -> dict:
-    """
-    Convert a plain-text schema like:
-        stadium: stadium_id(number), location(text), name(text)
-        singer:  singer_id(number), name(text), country(text)
-    into the normalised dict that HeuristicSchemaLinker expects.
-
-    Also handles JSON strings by importing json.
-    """
-    import json, re
-
-    # Try JSON first
+def _parse_plain_schema(text: str) -> Dict:
+    """Parse plain-text or JSON schema into the linker's normalised dict format."""
     stripped = text.strip()
     if stripped.startswith("{"):
         try:
@@ -245,7 +94,6 @@ def _parse_plain_schema(text: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # Plain-text line-by-line parse
     tables = []
     for line in text.splitlines():
         line = line.strip()
@@ -254,22 +102,325 @@ def _parse_plain_schema(text: str) -> dict:
         if ":" in line:
             tname, _, col_str = line.partition(":")
             columns = []
-            for col_part in col_str.split(","):
-                col_part = col_part.strip()
-                m = re.match(r"(\w+)\((\w+)\)", col_part)
+            for part in col_str.split(","):
+                part = part.strip()
+                m = re.match(r"(\w+)\((\w+)\)", part)
                 if m:
                     columns.append({"name": m.group(1), "type": m.group(2)})
-                elif col_part:
-                    columns.append({"name": col_part, "type": ""})
+                elif part:
+                    columns.append({"name": part, "type": ""})
             tables.append({"name": tname.strip(), "columns": columns})
-
     return {"db_id": "", "tables": tables}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Run directly
+# Global model state (loaded lazily on first real-model request)
 # ──────────────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+_MODEL_STATE: Dict[str, Any] = {"model": None, "tokenizer": None, "loaded": False}
+
+
+def _ensure_model_loaded(model_id: str = "codellama/CodeLlama-7b-hf") -> bool:
+    if _MODEL_STATE["loaded"]:
+        return True
+    try:
+        import torch
+        from transformers import (AutoModelForCausalLM, AutoTokenizer,
+                                   BitsAndBytesConfig)
+
+        tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+        if tok.pad_token is None:
+            tok.pad_token    = tok.eos_token
+            tok.pad_token_id = tok.eos_token_id
+        tok.padding_side = "left"
+
+        if torch.cuda.is_available():
+            bnb   = BitsAndBytesConfig(load_in_8bit=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id, quantization_config=bnb, device_map="auto"
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id, torch_dtype=torch.float32,
+                device_map="cpu", low_cpu_mem_usage=True,
+            )
+        model.eval()
+        _MODEL_STATE.update({"model": model, "tokenizer": tok, "loaded": True})
+        return True
+    except Exception as exc:
+        logger.warning("Model load failed: %s", exc)
+        return False
+
+
+def _real_inference(prompt: str) -> str:
+    import torch
+    model, tok = _MODEL_STATE["model"], _MODEL_STATE["tokenizer"]
+    inputs = tok(prompt, return_tensors="pt",
+                 truncation=True, max_length=512).to(model.device)
+    with torch.no_grad():
+        out = model.generate(
+            **inputs, max_new_tokens=128, do_sample=False,
+            repetition_penalty=1.1,
+            pad_token_id=tok.pad_token_id,
+            eos_token_id=tok.eos_token_id,
+        )
+    new = out[0, inputs["input_ids"].shape[1]:]
+    sql = tok.decode(new, skip_special_tokens=True).strip()
+    if ";" in sql:
+        sql = sql[: sql.index(";") + 1]
+    return sql
+
+
+def generate_sql(
+    question:  str,
+    schema:    Any,
+    demo_mode: bool = True,
+) -> Dict[str, Any]:
+    """
+    Core inference function shared by both FastAPI and Streamlit.
+
+    Parameters
+    ----------
+    question  : natural-language question
+    schema    : dict (normalised) or str (plain-text / JSON)
+    demo_mode : True → fast mock, False → real model
+
+    Returns
+    -------
+    dict with keys: sql, filtered_schema, complexity, mode, error
+    """
+    if isinstance(schema, str):
+        schema_dict = _parse_plain_schema(schema)
+    else:
+        schema_dict = schema or {}
+
+    filtered = _linker.filter_schema(schema_dict, question)
+
+    if demo_mode:
+        sql   = _mock_sql(question, filtered)
+        mode  = "demo"
+        error = None
+    else:
+        loaded = _ensure_model_loaded()
+        if not loaded:
+            sql   = _mock_sql(question, filtered)
+            mode  = "demo_fallback"
+            error = "Model failed to load — showing mock response"
+        else:
+            from config import Config
+            cfg    = Config()
+            prompt = cfg.prompt_template.format(schema=filtered, question=question)
+            sql    = _real_inference(prompt)
+            mode   = "real_model"
+            error  = None
+
+    return {
+        "sql":             sql,
+        "filtered_schema": filtered,
+        "complexity":      _estimate_complexity(sql),
+        "mode":            mode,
+        "error":           error,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FastAPI backend
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_api():
+    from fastapi import FastAPI, HTTPException
+    from pydantic import BaseModel
+
+    class QueryRequest(BaseModel):
+        question:  str
+        schema:    Any
+        demo_mode: bool = True
+
+    class QueryResponse(BaseModel):
+        sql:             str
+        filtered_schema: str
+        complexity:      str
+        mode:            str
+        error:           Optional[str] = None
+
+    api = FastAPI(
+        title="SQL Query Generator",
+        description="Text-to-SQL with CodeLlama-7B + Schema Linking",
+        version="1.0.0",
+    )
+
+    @api.get("/health")
+    def health():
+        return {"status": "ok", "model_loaded": _MODEL_STATE["loaded"]}
+
+    @api.post("/query", response_model=QueryResponse)
+    def query(req: QueryRequest):
+        try:
+            result = generate_sql(req.question, req.schema, demo_mode=req.demo_mode)
+            return QueryResponse(**result)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    return api
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Streamlit frontend
+# Streamlit re-imports this module — guard heavy code behind __name__ checks
+# ──────────────────────────────────────────────────────────────────────────────
+
+def run_streamlit() -> None:
+    import streamlit as st
+
+    st.set_page_config(
+        page_title="SQL Query Generator",
+        page_icon="🔍",
+        layout="wide",
+    )
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    st.title("🔍 LLM-Powered SQL Query Generator")
+    st.caption("CodeLlama-7B + QLoRA · Spider + WikiSQL · Schema Linking")
+
+    # ── Sidebar controls ──────────────────────────────────────────────────────
+    with st.sidebar:
+        st.header("⚙️ Settings")
+        demo_mode = st.toggle("Demo Mode (fast mock)", value=True)
+        if not demo_mode:
+            st.warning(
+                "Real model mode downloads CodeLlama-7B (~13 GB). "
+                "May be slow without a GPU."
+            )
+        st.markdown("---")
+        st.markdown("**Enhancements**")
+        st.markdown("✅ Multi-dataset training")
+        st.markdown("✅ Schema linking")
+        st.markdown("✅ Zero-shot baseline")
+        st.markdown("✅ Error analysis")
+
+    # ── Main inputs ───────────────────────────────────────────────────────────
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        st.subheader("Input")
+        question = st.text_input(
+            "Natural Language Question",
+            placeholder="How many singers are there?",
+        )
+
+        schema_input = st.text_area(
+            "Database Schema (plain text or JSON)",
+            height=180,
+            placeholder=(
+                "singer: singer_id, name, country, age\n"
+                "concert: concert_id, concert_name, theme, stadium_id\n"
+                "stadium: stadium_id, location, name, capacity"
+            ),
+        )
+
+        run_btn = st.button("🚀 Generate SQL", type="primary", use_container_width=True)
+
+    # ── Output ────────────────────────────────────────────────────────────────
+    with col2:
+        st.subheader("Output")
+
+        if run_btn and question and schema_input:
+            with st.spinner("Running pipeline …"):
+                result = generate_sql(question, schema_input, demo_mode=demo_mode)
+
+            if result.get("error"):
+                st.warning(f"⚠️ {result['error']}")
+
+            mode_label = {
+                "demo":          "🟡 Demo Mode",
+                "demo_fallback": "🟠 Demo Fallback",
+                "real_model":    "🟢 Real Model",
+            }.get(result["mode"], result["mode"])
+
+            st.markdown(f"**Mode:** {mode_label}")
+
+            st.markdown("**Filtered Schema** *(after schema linking)*")
+            st.code(result["filtered_schema"], language="sql")
+
+            st.markdown("**Generated SQL**")
+            st.code(result["sql"], language="sql")
+
+            complexity = result["complexity"]
+            colour = {"easy": "green", "medium": "blue",
+                      "hard": "orange", "extra hard": "red"}.get(complexity, "gray")
+            st.markdown(
+                f"**Complexity:** :{colour}[{complexity.upper()}]"
+            )
+
+            # Execution status (mock — no live DB)
+            st.markdown("**Execution Status**")
+            st.info("ℹ️ Live execution requires Spider SQLite databases. "
+                    "Download from the Spider project page and set "
+                    "`spider_db_path` in config.py.")
+
+        elif run_btn:
+            st.error("Please enter both a question and a schema.")
+        else:
+            st.info("Enter a question and schema, then click **Generate SQL**.")
+
+    # ── Example gallery ───────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📚 Example Queries")
+
+    examples = [
+        ("How many singers are there?",
+         "singer: singer_id, name, country, age", "easy"),
+        ("List all concerts with theme 'Pop'",
+         "concert: concert_id, concert_name, theme, stadium_id", "medium"),
+        ("Which singers performed in more than one concert?",
+         "singer: singer_id, name\nsinger_in_concert: concert_id, singer_id", "hard"),
+    ]
+
+    cols = st.columns(len(examples))
+    for col, (q, s, diff) in zip(cols, examples):
+        with col:
+            colour = {"easy": "green", "medium": "blue", "hard": "orange"}.get(diff, "gray")
+            st.markdown(f"**:{colour}[{diff.upper()}]**")
+            st.markdown(f"*{q}*")
+            if st.button(f"Try →", key=q):
+                result = generate_sql(q, s, demo_mode=True)
+                st.code(result["sql"], language="sql")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Entry point — detect execution context
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _is_streamlit() -> bool:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
+
+
+if _is_streamlit():
+    # Streamlit called this module — run the UI
+    run_streamlit()
+
+elif __name__ == "__main__":
+    import argparse
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)
+
+    parser = argparse.ArgumentParser(description="SQL Generator API / UI")
+    sub    = parser.add_subparsers(dest="command")
+
+    api_p  = sub.add_parser("api",  help="Start FastAPI backend")
+    api_p.add_argument("--port", type=int, default=8000)
+    api_p.add_argument("--host", default="0.0.0.0")
+
+    args = parser.parse_args()
+
+    if args.command == "api" or args.command is None:
+        port = getattr(args, "port", 8000)
+        host = getattr(args, "host", "0.0.0.0")
+        print(f"\n🚀 Starting FastAPI server on http://{host}:{port}")
+        print("   POST /query  →  {question, schema, demo_mode}")
+        print("   GET  /health →  status check\n")
+        app = build_api()
+        uvicorn.run(app, host=host, port=port, reload=False)
