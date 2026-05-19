@@ -40,12 +40,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 logger = logging.getLogger(__name__)
 
-from utils.schema_linker import HeuristicSchemaLinker
-
-_linker = HeuristicSchemaLinker()
-
-# Default LoRA adapter path from config
+# Lazy singleton — imported and instantiated on first query, not at startup.
+# This avoids blocking NLTK corpus load during Streamlit's module import phase.
 _LORA_WEIGHTS_DIR = "./results/lora_weights"
+_linker_instance = None
+
+
+def _get_linker():
+    global _linker_instance
+    if _linker_instance is None:
+        from utils.schema_linker import HeuristicSchemaLinker
+        _linker_instance = HeuristicSchemaLinker()
+    return _linker_instance
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Mock SQL helpers
@@ -266,7 +272,7 @@ def generate_sql(
     else:
         schema_dict = schema or {}
 
-    filtered = _linker.filter_schema(schema_dict, question)
+    filtered = _get_linker().filter_schema(schema_dict, question)
 
     if demo_mode:
         sql   = _mock_sql(question, filtered)
@@ -555,11 +561,9 @@ def run_streamlit() -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _is_streamlit() -> bool:
-    try:
-        from streamlit.runtime.scriptrunner import get_script_run_ctx
-        return get_script_run_ctx() is not None
-    except Exception:
-        return False
+    # Check sys.modules — Streamlit imports itself before running the user script,
+    # so this is always True in Streamlit context and never requires importing Streamlit.
+    return "streamlit" in sys.modules
 
 
 if _is_streamlit():

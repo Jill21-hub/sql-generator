@@ -1,0 +1,11 @@
+[server]
+# "none" stops Streamlit watching installed-library files (NLTK, transformers, etc.)
+# which is the main cause of slow startup on Windows. Use "watchdog" or "poll"
+# only if you need hot-reload during active development.
+fileWatcherType = "none"
+
+# Suppress the "running on localhost" browser tab opening automatically
+headless = false
+
+[browser]
+gatherUsageStats = false
