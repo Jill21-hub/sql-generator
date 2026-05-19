@@ -95,40 +95,61 @@ def _apply_lora(model, cfg: Config):
     return model
 
 
-def _build_training_args(cfg: Config) -> SFTConfig:
+def _build_training_args(cfg: Config, dry_run: bool = False) -> SFTConfig:
     tc = cfg.training
     os.makedirs(tc.output_dir, exist_ok=True)
     os.makedirs(tc.logging_dir, exist_ok=True)
+
+    # FIX: dry_run overrides — run 10 steps only to verify the full pipeline
+    # fires without crashing before committing to a multi-hour training run.
+    max_steps    = 10 if dry_run else -1   # -1 = use num_train_epochs
+    save_steps   = 5  if dry_run else tc.save_steps
+    logging_steps = 2 if dry_run else tc.logging_steps
+
+    if dry_run:
+        logger.info("🔥 DRY RUN — max_steps=10, save_steps=5, logging_steps=2")
+
     return SFTConfig(
         # SFT-specific
         max_length=tc.max_seq_length,
         dataset_text_field="text",
         packing=False,
-        completion_only_loss=True,   # replaces DataCollatorForCompletionOnlyLM
-        # Standard training args
-        output_dir=tc.output_dir,
+        completion_only_loss=True,
+        # Run identity
+        run_name=tc.run_name,               # FIX: named run for logs/trackers
+        output_dir=tc.output_dir,           # FIX: ./checkpoints
+        # Steps / epochs — max_steps>0 overrides num_train_epochs in Trainer
         num_train_epochs=tc.num_train_epochs,
+        max_steps=max_steps,                # FIX: dry_run=10, full=-1
+        # Batch / memory
         per_device_train_batch_size=tc.per_device_train_batch_size,
         per_device_eval_batch_size=tc.per_device_eval_batch_size,
         gradient_accumulation_steps=tc.gradient_accumulation_steps,
         gradient_checkpointing=tc.gradient_checkpointing,
+        # Optimiser
         learning_rate=tc.learning_rate,
         weight_decay=tc.weight_decay,
         warmup_ratio=tc.warmup_ratio,
         lr_scheduler_type=tc.lr_scheduler_type,
         optim=tc.optim,
+        # FIX: fp16=True / bf16=False — T4 lacks full BF16 support with bnb 4-bit
         fp16=tc.fp16,
         bf16=tc.bf16,
-        logging_steps=tc.logging_steps,
+        fp16_opt_level="O1",                # FIX: standard AMP level for fp16
+        # Logging
+        logging_steps=logging_steps,
+        logging_dir=tc.logging_dir,
+        report_to=tc.report_to,
+        # Evaluation
         eval_strategy="steps",
         eval_steps=tc.eval_steps,
+        # Checkpointing
         save_strategy="steps",
-        save_steps=tc.save_steps,
-        save_total_limit=tc.save_total_limit,
+        save_steps=save_steps,              # FIX: 500 full / 5 dry-run
+        save_total_limit=tc.save_total_limit,  # FIX: keep 3 checkpoints
         load_best_model_at_end=tc.load_best_model_at_end,
         metric_for_best_model=tc.metric_for_best_model,
-        report_to=tc.report_to,
-        logging_dir=tc.logging_dir,
+        # DataLoader
         dataloader_num_workers=tc.dataloader_num_workers,
         dataloader_pin_memory=tc.dataloader_pin_memory,
         remove_unused_columns=False,
@@ -194,7 +215,8 @@ def main(args: argparse.Namespace) -> None:
     torch.cuda.empty_cache()
 
     # ── Trainer ───────────────────────────────────────────────────────────────
-    training_args = _build_training_args(cfg)
+    # FIX: pass dry_run flag so step/checkpoint overrides are applied
+    training_args = _build_training_args(cfg, dry_run=args.dry_run)
 
     trainer = SFTTrainer(
         model=model,
@@ -224,5 +246,14 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Cap training examples (useful for smoke tests)",
+    )
+    # FIX: --dry_run — runs exactly 10 steps to verify the pipeline end-to-end
+    # without committing to a full training run. All other args remain unchanged.
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+        default=False,
+        help="Run 10 steps only (max_steps=10, save_steps=5, logging_steps=2) "
+             "to verify the pipeline fires correctly on Kaggle before full training.",
     )
     main(parser.parse_args())

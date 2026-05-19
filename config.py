@@ -50,9 +50,12 @@ class QuantizationConfig:
 
 @dataclass
 class TrainingConfig:
-    output_dir: str = "./results"
+    # FIX: checkpoints go to ./checkpoints; final LoRA adapters still saved to lora_weights_dir
+    output_dir: str = "./checkpoints"
     lora_weights_dir: str = "./results/lora_weights"
     logging_dir: str = "./results/logs"
+    # FIX: human-readable run label shown in logs and any experiment tracker
+    run_name: str = "sql-generator-qlora"
 
     num_train_epochs: int = 3
     max_seq_length: int = 512
@@ -72,14 +75,15 @@ class TrainingConfig:
     # 8-bit paged optimizer — essential for QLoRA on 16 GB T4
     optim: str = "paged_adamw_8bit"
 
-    # T4: fp16 yes / bf16 no
+    # FIX: T4 lacks full BFloat16 support with bitsandbytes 4-bit — fp16 only
     fp16: bool = True
     bf16: bool = False
 
     logging_steps: int = 25
     eval_steps: int = 500
+    # FIX: save_steps=500 and save_total_limit=3 for reliable checkpoint coverage
     save_steps: int = 500
-    save_total_limit: int = 2
+    save_total_limit: int = 3
     load_best_model_at_end: bool = True
     metric_for_best_model: str = "eval_loss"
 
