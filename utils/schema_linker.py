@@ -3,25 +3,24 @@ utils/schema_linker.py — Production-Ready Heuristic Schema Linker
 ==================================================================
 # PROPOSAL_REF: Enhancement 2 — Schema Linking Preprocessing
 
-Filters a database schema down to only the tables and columns that are
-relevant to the natural-language question.  This keeps prompts compact and
-prevents the model from being distracted by irrelevant schema nodes.
+Filters a database schema down to only the tables and columns relevant
+to the natural-language question, keeping prompts compact.
 
 Strategy
 --------
 1. Tokenise the question (lower-case, strip punctuation, remove stop-words).
-2. For every table/column, split its identifier into sub-tokens
+2. Split each table/column identifier into sub-tokens
    (snake_case → ["student", "id"], CamelCase → ["student", "name"]).
-3. Keep a table if ANY of its identifier tokens overlap with the question
-   tokens, OR if any of its columns match.
-4. When nothing matches, fall back to the first two tables (minimal context).
+3. Keep a table if ANY identifier tokens overlap with question tokens,
+   OR if any of its columns match.
+4. When nothing matches, fall back to the first two tables.
 
-Output format: Table1(col1, col2) | Table2(col3, col4)
+Output: Table1(col1, col2) | Table2(col3, col4)
 
-No external embeddings or DB catalogues are required — pure heuristics.
+No external embeddings or DB catalogues required — pure heuristics.
 
 Usage:
-    python utils/schema_linker.py          # runs built-in test suite
+    python utils/schema_linker.py          # run built-in test suite
 """
 
 from __future__ import annotations
@@ -33,17 +32,15 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
-# ── Project root on sys.path ──────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# Windows terminals default to cp1252 — force UTF-8 so emoji/box chars render
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Optional NLTK integration (graceful fallback to str.split)
+# Optional NLTK (graceful fallback to str.split)
 # ──────────────────────────────────────────────────────────────────────────────
 
 try:
@@ -71,7 +68,7 @@ except Exception:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Domain stop-words
+# Domain stop-words (SQL / NL query words that add no schema signal)
 # ──────────────────────────────────────────────────────────────────────────────
 
 _DOMAIN_STOP_WORDS: Set[str] = {
@@ -85,6 +82,7 @@ _DOMAIN_STOP_WORDS: Set[str] = {
     "and", "or", "but", "not",
     "all", "any", "each", "every", "some",
     "between", "across", "by", "from", "into",
+    "me", "us", "their", "its",
 }
 
 SchemaDict = Dict[str, Any]
@@ -100,7 +98,7 @@ class HeuristicSchemaLinker:
 
     Parameters
     ----------
-    min_token_length      : Identifier sub-tokens shorter than this are ignored.
+    min_token_length      : Ignore identifier sub-tokens shorter than this.
     max_columns_per_table : Hard cap on columns included per matched table.
     """
 
@@ -109,25 +107,25 @@ class HeuristicSchemaLinker:
         min_token_length: int = 2,
         max_columns_per_table: int = 12,
     ) -> None:
-        self.min_token_length     = min_token_length
+        self.min_token_length      = min_token_length
         self.max_columns_per_table = max_columns_per_table
-        self._punct_re = re.compile(f"[{re.escape(string.punctuation)}]")
+        self._punct_re   = re.compile(f"[{re.escape(string.punctuation)}]")
         self._stop_words: Set[str] = _DOMAIN_STOP_WORDS | _NLTK_STOP_WORDS
 
-    # ── Tokenisation helpers ──────────────────────────────────────────────────
+    # ── Tokenisation ──────────────────────────────────────────────────────────
 
     def _tokenize_question(self, question: str) -> Set[str]:
         text = question.lower()
         if _NLTK_AVAILABLE:
             try:
-                raw_tokens = _nltk_tokenize(text)
+                raw = _nltk_tokenize(text)
             except Exception:
-                raw_tokens = self._punct_re.sub(" ", text).split()
+                raw = self._punct_re.sub(" ", text).split()
         else:
-            raw_tokens = self._punct_re.sub(" ", text).split()
+            raw = self._punct_re.sub(" ", text).split()
 
         return {
-            t for t in raw_tokens
+            t for t in raw
             if len(t) >= self.min_token_length and t not in self._stop_words
         }
 
@@ -138,21 +136,29 @@ class HeuristicSchemaLinker:
         return {p for p in parts if len(p) >= self.min_token_length}
 
     def _overlaps(self, id_tokens: Set[str], q_tokens: Set[str]) -> bool:
-        return bool(id_tokens & q_tokens)
+        if id_tokens & q_tokens:
+            return True
+        # Handle plural/singular and prefix: "singers" ↔ "singer", "countries" ↔ "country"
+        for id_tok in id_tokens:
+            for q_tok in q_tokens:
+                min_len = min(len(id_tok), len(q_tok))
+                if min_len >= 4 and (q_tok.startswith(id_tok) or id_tok.startswith(q_tok)):
+                    return True
+        return False
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def filter_schema(self, schema_json: SchemaDict, question: str) -> str:
         """
-        Return a compact schema string containing only relevant tables/columns.
+        Return a compact schema string with only relevant tables/columns.
 
         Output format:
             Table1(col1, col2) | Table2(col3, col4)
 
         Parameters
         ----------
-        schema_json : normalised schema dict with 'db_id' and 'tables' keys.
-        question    : the natural-language question to answer with SQL.
+        schema_json : Normalised schema dict with 'tables' key.
+        question    : Natural-language question.
         """
         if not schema_json:
             return ""
@@ -176,12 +182,11 @@ class HeuristicSchemaLinker:
                 col_name = col.get("name", "")
                 if not col_name or col_name == "*":
                     continue
-                col_repr = col_name
-                all_cols.append(col_repr)
+                all_cols.append(col_name)
 
                 c_tokens = self._split_identifier(col_name)
                 if table_matched or self._overlaps(c_tokens, q_tokens):
-                    matched_cols.append(col_repr)
+                    matched_cols.append(col_name)
 
             if matched_cols:
                 cols_str = ", ".join(matched_cols[: self.max_columns_per_table])
@@ -190,8 +195,7 @@ class HeuristicSchemaLinker:
                 cols_str = ", ".join(all_cols[: self.max_columns_per_table])
                 matched_parts.append(f"{table_name}({cols_str})")
 
-        # Fallback: nothing matched → return first two tables so the model
-        # has at least some schema context.
+        # Fallback: return first two tables so the model has at least some context
         if not matched_parts:
             logger.debug(
                 "SchemaLinker: no overlap for '%s'. Falling back to first 2 tables.",
@@ -208,8 +212,6 @@ class HeuristicSchemaLinker:
 
         return " | ".join(matched_parts)
 
-    # ── Diagnostics ───────────────────────────────────────────────────────────
-
     def explain(self, schema_json: SchemaDict, question: str) -> Dict[str, Any]:
         """Debug helper — returns question tokens and per-table match details."""
         q_tokens = self._tokenize_question(question)
@@ -223,19 +225,23 @@ class HeuristicSchemaLinker:
                 c_tokens = self._split_identifier(cname)
                 col_matches[cname] = bool(c_tokens & q_tokens)
             breakdown.append({
-                "table":         tname,
-                "table_tokens":  t_tokens,
-                "table_matched": bool(t_tokens & q_tokens),
+                "table":          tname,
+                "table_tokens":   t_tokens,
+                "table_matched":  bool(t_tokens & q_tokens),
                 "column_matches": col_matches,
             })
         return {"question_tokens": q_tokens, "tables": breakdown}
 
+    def test(self) -> bool:
+        """Run the built-in test suite. Returns True if all cases pass."""
+        return test_linker()
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Built-in test suite — presentation-ready console output
+# PROPOSAL_REF: Enhancement 2
 # ──────────────────────────────────────────────────────────────────────────────
 
-# PROPOSAL_REF: Enhancement 2
 _TEST_CASES = [
     {
         "name": "Single-table match (easy)",
@@ -243,7 +249,7 @@ _TEST_CASES = [
         "schema": {
             "db_id": "concert_singer",
             "tables": [
-                {"name": "singer",  "columns": [
+                {"name": "singer", "columns": [
                     {"name": "singer_id"}, {"name": "name"},
                     {"name": "country"},  {"name": "age"},
                 ]},
@@ -257,6 +263,7 @@ _TEST_CASES = [
                 ]},
             ],
         },
+        "expected_tables": ["singer"],
     },
     {
         "name": "Multi-table JOIN (medium)",
@@ -264,17 +271,18 @@ _TEST_CASES = [
         "schema": {
             "db_id": "concert_singer",
             "tables": [
-                {"name": "singer",        "columns": [
+                {"name": "singer", "columns": [
                     {"name": "singer_id"}, {"name": "name"}, {"name": "country"},
                 ]},
                 {"name": "singer_in_concert", "columns": [
                     {"name": "concert_id"}, {"name": "singer_id"},
                 ]},
-                {"name": "concert",       "columns": [
+                {"name": "concert", "columns": [
                     {"name": "concert_id"}, {"name": "concert_name"}, {"name": "theme"},
                 ]},
             ],
         },
+        "expected_tables": ["singer", "singer_in_concert", "concert"],
     },
     {
         "name": "No overlap → fallback (hard)",
@@ -282,63 +290,84 @@ _TEST_CASES = [
         "schema": {
             "db_id": "university",
             "tables": [
-                {"name": "faculty",     "columns": [
+                {"name": "faculty", "columns": [
                     {"name": "faculty_id"}, {"name": "rank"}, {"name": "salary"},
                 ]},
-                {"name": "enrollment",  "columns": [
+                {"name": "enrollment", "columns": [
                     {"name": "student_id"}, {"name": "course_id"}, {"name": "grade"},
                 ]},
             ],
         },
+        "expected_tables": ["faculty", "enrollment"],  # fallback returns both
+    },
+    {
+        "name": "Column-level match (medium)",
+        "question": "What is the average age and country of all singers?",
+        "schema": {
+            "db_id": "concert_singer",
+            "tables": [
+                {"name": "singer", "columns": [
+                    {"name": "singer_id"}, {"name": "name"},
+                    {"name": "country"},  {"name": "age"},
+                ]},
+                {"name": "concert", "columns": [
+                    {"name": "concert_id"}, {"name": "concert_name"},
+                ]},
+            ],
+        },
+        "expected_tables": ["singer"],
     },
 ]
 
 
-def test_linker() -> None:
+def test_linker() -> bool:
     """
-    Run 3 example schema-linking cases and print before/after for presentation.
+    Run built-in schema-linking test cases.
     # PROPOSAL_REF: Enhancement 2
+    Returns True if all tests pass.
     """
     linker = HeuristicSchemaLinker()
-    sep    = "─" * 64
+    sep    = "─" * 66
 
     print()
-    print("=" * 64)
+    print("=" * 66)
     print("  Schema Linker — Built-in Test Suite")
     print("  PROPOSAL_REF: Enhancement 2")
-    print("=" * 64)
+    print("=" * 66)
 
     all_passed = True
     for i, tc in enumerate(_TEST_CASES, 1):
         schema   = tc["schema"]
         question = tc["question"]
+        expected = set(tc.get("expected_tables", []))
 
-        # Full schema (before)
         all_tables = schema.get("tables", [])
         full_repr  = " | ".join(
-            f"{t['name']}({', '.join(c['name'] for c in t.get('columns',[]))})"
+            f"{t['name']}({', '.join(c['name'] for c in t.get('columns', []))})"
             for t in all_tables
         )
 
-        # Filtered schema (after)
         filtered = linker.filter_schema(schema, question)
         explain  = linker.explain(schema, question)
 
-        n_before = sum(len(t.get("columns", [])) for t in all_tables)
-        n_after  = filtered.count(",") + filtered.count("(")
-        passed   = bool(filtered)
+        # Check that all expected tables appear in output
+        got_tables = set(re.findall(r"(\w+)\(", filtered))
+        passed     = expected.issubset(got_tables) if expected else bool(filtered)
         all_passed = all_passed and passed
+
+        n_before = sum(len(t.get("columns", [])) for t in all_tables)
+        n_after  = len(re.findall(r"\w+", filtered.replace("|", ""))) - filtered.count("(")
 
         print()
         print(f"  Test {i}: {tc['name']}")
         print(sep)
-        print(f"  Question : {question}")
-        print(f"  Q-tokens : {sorted(explain['question_tokens'])}")
+        print(f"  Question  : {question}")
+        print(f"  Q-tokens  : {sorted(explain['question_tokens'])}")
         print()
-        print(f"  BEFORE   ({len(all_tables)} tables, ~{n_before} cols):")
+        print(f"  BEFORE ({len(all_tables)} tables, ~{n_before} cols):")
         print(f"    {full_repr}")
         print()
-        print(f"  AFTER    (filtered):")
+        print(f"  AFTER  (filtered):")
         print(f"    {filtered}")
         print()
         print(f"  {'✅ PASS' if passed else '❌ FAIL'}")
@@ -346,8 +375,9 @@ def test_linker() -> None:
 
     print()
     print(f"  Overall: {'✅ All tests passed' if all_passed else '❌ Some tests failed'}")
-    print("=" * 64)
+    print("=" * 66)
     print()
+    return all_passed
 
 
 # ──────────────────────────────────────────────────────────────────────────────
