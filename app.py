@@ -547,8 +547,7 @@ def run_streamlit() -> None:
                 "Gold SQL":   r.get("gold_sql", "")[:60],
             })
 
-        import pandas as pd
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        st.table(rows)
     else:
         st.info(
             "No eval results yet. Run `python eval.py --mock` to generate "
